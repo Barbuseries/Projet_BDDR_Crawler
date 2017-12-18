@@ -1,4 +1,7 @@
+import java.io.{FileInputStream, FileOutputStream, ObjectInputStream, ObjectOutputStream}
+
 import org.apache.spark.broadcast.Broadcast
+import org.apache.spark.rdd.RDD
 import org.apache.spark.{SparkConf, SparkContext}
 import org.jsoup.nodes.Document
 import org.jsoup.{HttpStatusException, Jsoup}
@@ -9,6 +12,9 @@ import scala.collection.mutable
 
 object Main {
   val baseUrl = "http://www.d20pfsrd.com/bestiary/monster-listings"
+  val filename = "crawl_result.dat"
+
+  type WebMap = Broadcast[TrieMap[String, Int]]
 
   def getDoc(url: String): Document = {
     try {
@@ -22,7 +28,7 @@ object Main {
     }
   }
 
-  def crawlCreature(url: String, pagesVisited: Broadcast[TrieMap[String, Int]]): Creature = {
+  def crawlCreature(url: String, pagesVisited: WebMap): Creature = {
     if (pagesVisited.value.contains(url)) return null
     else pagesVisited.value.put(url, 1)
 
@@ -31,7 +37,7 @@ object Main {
 
     val elems = doc.select("[class=spell]")
 
-    val spells = (for (e <- elems) yield e.text).distinct.map(s => s.split(" ").map(_.capitalize).mkString(" "))
+    val spells = (for (e <- elems) yield e.text).distinct.map(s => s.split(" ").map(_.capitalize).mkString(" ")).filter(_ != "")
     if (spells.length == 0) return null
 
 
@@ -54,7 +60,7 @@ object Main {
     return new Creature(name, category, spells)
   }
 
-  def crawlAllCreaturesFromCategory(url: String, pagesVisited: Broadcast[TrieMap[String, Int]]): mutable.Buffer[Creature] = {
+  def crawlAllCreaturesFromCategory(url: String, pagesVisited: WebMap): mutable.Buffer[Creature] = {
     val completeUrl = url
 
     val doc = getDoc(url)
@@ -66,11 +72,6 @@ object Main {
 
     // A creature may be the only one in a category.
     // In that case, the page is directly it's description.
-    // NOTE: Checking for links may not be the best idea (what happens if a monster
-    //       links to another monster in the same category?).
-    //       Another option is to look at the title 'Category, Name' or just 'Category'
-    // FIXME: Checking for links is not correct for Mandragora (a monster by itself) as well as a category
-    //        (Immense Mandragora, Swarm Mandragora).
     if (links.length == 0) {
       links += completeUrl
     }
@@ -108,32 +109,70 @@ object Main {
     return crawlDeeper(completeUrl)
   }
 
+  def save[T](thing: T, filename: String): Unit = {
+    println("Saving...")
+    val os = new ObjectOutputStream(new FileOutputStream(filename))
+    os.writeObject(thing)
+    os.close()
+    println("Done.")
+  }
+
+  def load[T](filename: String): T = {
+    try {
+      val is = new ObjectInputStream(new FileInputStream(filename))
+      val obj = is.readObject().asInstanceOf[T]
+      is.close()
+
+      return obj
+    }
+    catch{
+      case _: Throwable => null.asInstanceOf[T]
+    }
+  }
+
   def main(args: Array[String]) {
     val conf = new SparkConf()
       .setAppName("toto")
-      .setMaster("local[40]")
+      .setMaster("local[*]")
 
     val sc = new SparkContext(conf)
     sc.setLogLevel("ERROR")
 
-    val creatureType = "outsiders"
-
     val pagesVisited = sc.broadcast(TrieMap.empty[String, Int])
 
-    val allCreatureTypes = sc.makeRDD(crawlTypesFromBaseUrl())
+    var oldCrawl = load[Array[Creature]](filename)
+    var allCreatures: RDD[Creature] = sc.emptyRDD[Creature]
 
-    // TODO: Make a "batch view" for each category? (Only merge at the end (join on the spell name or something)
-    val result = allCreatureTypes.flatMap(t => crawlCategoriesFromType(t) // get all categories
-                                    .flatMap(cat => crawlAllCreaturesFromCategory(cat, pagesVisited) // get all creatures
-                                    .groupBy(_.name).map(_._2.head) // get creatures uniquely (e.g, url ~= XXX, XXX-2)
-                                    .flatMap(c => c.spellList.map(s => (s, c.name))))) // map by (formalized) spell name
-                                 .groupBy(_._1).mapValues(_.map(_._2)) // group by spell name
+    var result: Array[(String, List[String])] = null
+    val needsCrawl = (oldCrawl == null)
+
+    if (needsCrawl) {
+      val allCreatureTypes = sc.makeRDD(crawlTypesFromBaseUrl())
 
 
+      allCreatures = allCreatureTypes.flatMap(t => crawlCategoriesFromType(t) // get all categories
+                                     .flatMap(cat => crawlAllCreaturesFromCategory(cat, pagesVisited) // get all creatures
+                                       .groupBy(_.name).map(_._2.head))) // get creatures uniquely (e.g, url ~= XXX, XXX-2)
+
+
+
+      val temp = allCreatures.collect()
+      save(temp, filename)
+
+      oldCrawl = load[Array[Creature]](filename)
+    }
+
+    allCreatures = sc.makeRDD(oldCrawl)
+
+    result = allCreatures.flatMap(c => c.spellList.map(s => (s, List(c.name)))) // map by (formalized) spell name
+                         .reduceByKey((a, b) => a ++ b) // group by spell name
+                         .sortBy(_._1).collect()
+
+    println(s"Spell count: ${result.length}")
     for (r <- result) {
         println(r._1, r._2)
     }
 
-    println(pagesVisited.value.size)
+    if (needsCrawl) println(s"Total pages visited: ${pagesVisited.value.size}")
   }
 }
